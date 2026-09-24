@@ -1,0 +1,9 @@
+{
+  "name": "contextgraph-how-it-works",
+  "private": true,
+  "description": "Renders images/how-it-works.gif",
+  "type": "module",
+  "devDependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}
