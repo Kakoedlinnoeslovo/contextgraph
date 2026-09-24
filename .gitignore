@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 .contextgraph/
 dist/
+.DS_Store
+images/how-it-works/node_modules/
+images/how-it-works/package-lock.json
+images/how-it-works/data.js
+images/how-it-works/stills/
+images/how-it-works/frames/

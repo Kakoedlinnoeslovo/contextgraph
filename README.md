@@ -122,6 +122,18 @@ Sections with nothing to show are left out. When the task matches Markdown docs,
 
 ## How it works
 
+![Animation: ContextGraph searches celery's knowledge graph, follows its links and packs the result into a 3,000-token briefing](images/how-it-works.gif)
+
+The animation replays one real query on celery:
+
+1. **Search.** Keyword search and semantic search find 71 matching symbols.
+2. **Graph walk.** Following links two hops out from the best 15 adds 35 more.
+3. **Pack.** Ranking and the 3,000-token budget keep 10 symbols, 8 tests and a saved memory. Only one of those tests was a search hit. The other 7 came from following links out from the chosen code.
+
+The result is a 2.9k-token briefing. Reading the 6 files it draws on would cost about 50k tokens, and reading every Python file that mentions "revoke" about 316k. These are estimates at 3.3 characters per token, for this one query.
+
+Under the hood, indexing and answering fit together like this:
+
 ```mermaid
 flowchart TB
     subgraph index["contextgraph index"]
@@ -235,6 +247,8 @@ uv run pytest
 ```
 
 To re-record the demo GIF, install [vhs](https://github.com/charmbracelet/vhs) and run `vhs images/demo.tape` (see the comments in the tape for setup).
+
+The "How it works" animation is drawn from a real index. `images/how-it-works/extract.py` records what each retrieval stage picked for one query. Then `node record.mjs` renders `index.html` frame by frame into the GIF (it needs Node and ffmpeg). Both files start with a comment giving the exact commands.
 
 ## License
 

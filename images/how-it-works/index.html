@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>How ContextGraph works</title>
+<!-- Source of images/how-it-works.gif. Open it in a browser to watch it play;
+     record.mjs renders it frame by frame. The data comes from extract.py. -->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; background: #1e1e2e; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1000" height="600"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="data.js"></script>
+<script>
+"use strict";
+const D = window.DATA;
+const W = 1000, H = 600;
+const GRAPH = { x: 20, y: 84, w: 576, h: 496 };   // left: the knowledge graph
+const PX = 632;                                    // right: waterfall + token chart
+const COL = {
+  surface: "#1e1e2e", ink: "#cdd6f4", ink2: "#a6adc8", muted: "#9399b2", hair: "#313244",
+  dot: "#6c7086", bar: "#6c7086",
+  // Categorical slots 1-3, validated for dark mode on #1e1e2e with all pairs (any two nodes can touch).
+  search: "#3987e5", walk: "#d95926", brief: "#199e70",
+};
+const SANS = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+const MONO = 'Menlo, "SF Mono", Consolas, monospace';
+const LABEL_FONT = `12.5px ${MONO}`;
+const DURATION = 24;
+
+// Timeline, in seconds.
+const T = {
+  type: [0.2, 1.3], search: [1.4, 3.2], seeds: [3.6, 4.4], walk1: [4.8, 6.0], walk2: [6.0, 7.2],
+  pack: [7.8, 8.8], focus: [9.4, 11.0], labels: [10.8, 11.8], bars: [12.4, 15.4], callout: [15.6, 16.4],
+};
+
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const seg = (t, [a, b]) => clamp((t - a) / (b - a));
+const ease = x => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const lerp = (a, b, x) => a + (b - a) * x;
+const fmt = n => n.toLocaleString("en-US");
+const kfmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : (n / 1e3).toFixed(1) + "k";
+
+const ctx = document.getElementById("c").getContext("2d");
+
+// ---- The graph: one spiral cluster per file, clusters placed by a force layout on file-to-file links.
+const files = D.files.map(([path, test], i) => ({ i, path, test, members: [] }));
+D.nodes.forEach((n, idx) => files[n[0]].members.push(idx));
+files.forEach(f => { f.r = Math.sqrt(f.members.length) + 1.5; });
+const sim = d3.forceSimulation(files)
+  .randomSource(d3.randomLcg(42))
+  .force("link", d3.forceLink(D.fileLinks.map(([a, b, w]) => ({ source: a, target: b, w })))
+    .id(f => f.i).strength(l => 0.02 + 0.25 * Math.min(1, l.w / 25)).distance(l => l.source.r + l.target.r + 5))
+  .force("charge", d3.forceManyBody().strength(f => -1.5 - 1.6 * f.r))
+  .force("collide", d3.forceCollide(f => f.r + 1.4).iterations(3))
+  .force("x", d3.forceX(0).strength(0.08))
+  .force("y", d3.forceY(0).strength(0.1))
+  .stop();
+for (let k = 0; k < 500; k++) sim.tick();
+
+const pos = new Float32Array(D.nodes.length * 2);
+{
+  const x0 = d3.min(files, f => f.x - f.r), x1 = d3.max(files, f => f.x + f.r);
+  const y0 = d3.min(files, f => f.y - f.r), y1 = d3.max(files, f => f.y + f.r);
+  const s = Math.min(GRAPH.w / (x1 - x0), GRAPH.h / (y1 - y0));
+  const ox = GRAPH.x + (GRAPH.w - s * (x1 - x0)) / 2 - s * x0;
+  const oy = GRAPH.y + (GRAPH.h - s * (y1 - y0)) / 2 - s * y0;
+  for (const f of files) {
+    f.members.forEach((idx, j) => {   // members are sorted by importance: hubs sit in the middle
+      const a = j * 2.399963, r = Math.sqrt(j + 0.5);
+      pos[2 * idx] = ox + s * (f.x + r * Math.cos(a));
+      pos[2 * idx + 1] = oy + s * (f.y + r * Math.sin(a));
+    });
+  }
+}
+const P = i => [pos[2 * i], pos[2 * i + 1]];
+
+// ---- Stages.
+const S = D.stages;
+const seeds = new Set(S.seeds);
+const hitSet = new Set(S.hits);
+const walkNew = S.walk.filter(w => !hitSet.has(w[0]));   // reached by the walk and not already found by search
+const walk1 = S.walk.filter(w => w[3] === 1), walk2 = S.walk.filter(w => w[3] === 2);
+const code = [...new Set([...S.picked.symbols, ...S.picked.source])];
+const tests = [...new Set(S.picked.tests)];
+const picked = new Set([...code, ...tests]);
+const memory = S.memories[0];
+
+// ---- The briefing as a diagram: callers above callees, each test flies into a badge on the symbol it covers.
+const label = i => {
+  const full = D.labels[i] || D.nodes[i][2];
+  return full.length <= 19 ? full : D.nodes[i][2];
+};
+const focus = new Map();
+const FL = (() => {
+  ctx.font = LABEL_FONT;
+  const set = new Set(code);
+  const calls = D.links.filter(([s, t, r]) => D.relations[r] === "calls" && set.has(s) && set.has(t) && s !== t);
+  const connected = new Set(calls.flat());
+  // Layers: longest call path from the top, then callers with no callers of their own sit
+  // right above their highest callee, so every arrow spans one row.
+  const layer = new Map(code.map(i => [i, 0]));
+  for (let k = 0; k < code.length; k++)
+    for (const [s, t] of calls) layer.set(t, Math.max(layer.get(t), layer.get(s) + 1));
+  for (const i of connected) if (!calls.some(c => c[1] === i))
+    layer.set(i, d3.min(calls.filter(c => c[0] === i), c => layer.get(c[1])) - 1);
+  const rows = [];
+  const loose = code.filter(i => !connected.has(i));
+  if (loose.length) rows.push(loose);            // symbols with no calls among the picked ones go on top
+  const first = rows.length;
+  for (const i of code) if (connected.has(i)) (rows[first + layer.get(i)] ||= []).push(i);
+
+  const width = i => ctx.measureText(label(i)).width + 20;
+  let mem = null;
+  const memTarget = memory ? memory.about.find(i => set.has(i)) : undefined;
+  if (memory) {
+    const text = `memory: ${memory.topic || memory.uid}`;
+    mem = { text, w: ctx.measureText(text).width + 20, target: memTarget };
+  }
+  const GAP = 18, PITCH = 72;
+  const top = GRAPH.y + 34 + ((GRAPH.h - 110) - (rows.length - 1) * PITCH) / 2;
+  const placeRow = l => {
+    const row = rows[l];
+    const hasMem = mem && row.includes(memTarget);
+    if (hasMem) row.push(row.splice(row.indexOf(memTarget), 1)[0]);   // the memory sits right of its symbol
+    const widths = row.map(width);
+    const total = d3.sum(widths) + GAP * (row.length - 1) + (hasMem ? GAP + 10 + mem.w : 0);
+    let x = GRAPH.x + (GRAPH.w - total) / 2;
+    const y = top + l * PITCH;
+    row.forEach((i, k) => {
+      focus.set(i, { x: x + widths[k] / 2, y, w: widths[k], text: label(i), tests: 0 });
+      x += widths[k] + GAP;
+    });
+    if (hasMem) Object.assign(mem, { x: x + 10 + mem.w / 2, y });
+  };
+  // Order the rows to avoid crossings: sweep down by callers, then up by callees, row by row.
+  const parents = n => calls.filter(c => c[1] === n).map(c => c[0]);
+  const children = n => calls.filter(c => c[0] === n).map(c => c[1]);
+  const orderBy = (l, rel) => {
+    const key = new Map(rows[l].map(n => [n, d3.mean(rel(n), m => focus.get(m).x) ?? focus.get(n).x]));
+    rows[l].sort((a, b) => key.get(a) - key.get(b));
+    placeRow(l);
+  };
+  rows.forEach((_, l) => placeRow(l));
+  for (let sweep = 0; sweep < 3; sweep++) {
+    for (let l = first + 1; l < rows.length; l++) orderBy(l, parents);
+    for (let l = rows.length - 2; l >= first; l--) orderBy(l, children);
+  }
+  for (let l = first + 1; l < rows.length; l++) orderBy(l, parents);
+  if (mem && mem.x === undefined) Object.assign(mem, { x: GRAPH.x + GRAPH.w - mem.w / 2 - 4, y: top - PITCH * 0.7 });
+
+  // Each picked test joins the first picked symbol it tests.
+  const loneTests = [];
+  for (const tIdx of tests) {
+    const link = D.links.find(([s, t, r]) => t === tIdx && D.relations[r] === "tested_by" && set.has(s));
+    if (link) {
+      const f = focus.get(link[0]);
+      f.tests += 1;
+      focus.set(tIdx, { test: true, owner: link[0] });
+    } else loneTests.push(tIdx);
+  }
+  const loneY = top + rows.length * PITCH;
+  loneTests.forEach((tIdx, k) =>
+    focus.set(tIdx, { test: true, x: GRAPH.x + GRAPH.w / 2 + (k - (loneTests.length - 1) / 2) * 16, y: loneY }));
+  for (const f of focus.values()) if (f.owner !== undefined) {
+    const o = focus.get(f.owner);
+    Object.assign(f, { x: o.x + o.w / 2 - 3, y: o.y - 12 });
+  }
+  return { calls, memory: mem, loneTests, loneY };
+})();
+
+// ---- Pre-render the full graph once.
+const bg = document.createElement("canvas");
+bg.width = W; bg.height = H;
+{
+  const b = bg.getContext("2d");
+  b.lineWidth = 0.6;
+  b.strokeStyle = "rgba(166,173,200,0.05)";
+  b.beginPath();
+  for (const [s, t] of D.links) { b.moveTo(pos[2 * s], pos[2 * s + 1]); b.lineTo(pos[2 * t], pos[2 * t + 1]); }
+  b.stroke();
+  for (let i = 0; i < D.nodes.length; i++) {
+    b.fillStyle = D.nodes[i][1] === 2 ? "rgba(108,112,134,0.6)" : "rgba(166,173,200,0.65)";
+    b.fillRect(pos[2 * i] - 0.8, pos[2 * i + 1] - 0.8, 1.6, 1.6);
+  }
+}
+
+// ---- Drawing helpers.
+function dot(x, y, r, color, alpha = 1, ring = true) {
+  ctx.globalAlpha = alpha;
+  if (ring) { ctx.fillStyle = COL.surface; ctx.beginPath(); ctx.arc(x, y, r + 2, 0, 7); ctx.fill(); }
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+function text(str, x, y, { font = `13px ${SANS}`, color = COL.ink, align = "left", alpha = 1 } = {}) {
+  ctx.globalAlpha = alpha; ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = "alphabetic";
+  ctx.fillText(str, x, y); ctx.globalAlpha = 1;
+}
+function line(x0, y0, x1, y1, color, alpha, width = 1.4, dash = null, head = true) {
+  ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width;
+  if (dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  ctx.setLineDash([]);
+  if (head) {
+    const a = Math.atan2(y1 - y0, x1 - x0);
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - 7 * Math.cos(a - 0.4), y1 - 7 * Math.sin(a - 0.4));
+    ctx.lineTo(x1 - 7 * Math.cos(a + 0.4), y1 - 7 * Math.sin(a + 0.4));
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function pill(x, y, w, str, alpha, radius = 12, textAlpha = alpha) {
+  const h = 24;
+  ctx.globalAlpha = alpha; ctx.fillStyle = COL.surface;
+  ctx.beginPath(); ctx.roundRect(x - w / 2, y - h / 2, w, h, radius); ctx.fill();
+  ctx.globalAlpha = 0.2 * alpha; ctx.fillStyle = COL.brief; ctx.fill();
+  ctx.globalAlpha = alpha; ctx.strokeStyle = COL.brief; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.globalAlpha = 1;
+  if (str && textAlpha) text(str, x, y + 4.5, { font: LABEL_FONT, align: "center", alpha: textAlpha });
+}
+function badge(x, y, n, alpha) {
+  dot(x, y, 8.5, COL.brief, alpha);
+  text(String(n), x, y + 4, { font: `700 11px ${SANS}`, color: COL.surface, align: "center", alpha });
+}
+
+// Where a picked node is at time t: in the graph, or on its way into the diagram.
+function where(i, t) {
+  const [x, y] = P(i);
+  const f = focus.get(i);
+  const k = ease(seg(t, f.test ? [T.focus[0] + 0.5, T.focus[1] + 0.5] : T.focus));
+  return [lerp(x, f.x, k), lerp(y, f.y, k)];
+}
+
+// ---- Right panel: the waterfall of stages, then the token chart.
+const M = D.meta, K = D.tokens;
+const ROWS = [
+  { at: 0.3, color: COL.dot, title: `${M.repo}: ${fmt(M.symbols)} symbols, ${fmt(M.tests)} tests`,
+    detail: `${fmt(M.edges)} links, such as calls, imports and tests` },
+  { at: T.search[0], color: COL.search, title: `${S.hits.length} search hits`,
+    detail: `top ${S.keyword} by keyword + top ${S.semantic} by meaning` },
+  { at: T.walk1[0], color: COL.walk, title: `+${walkNew.length} more found through links`,
+    detail: `walking 2 hops out from the best ${S.seeds.length} hits` },
+  { at: T.pack[0], color: COL.brief, title: `${code.length} symbols, ${tests.length} tests, ${S.memories.length} memory`,
+    detail: `what fits in ${fmt(M.budget)} tokens; ${S.picked.more.length} more as path:line` },
+];
+const BARS = [
+  { label: `The whole repo (${K.repoFiles} files)`, value: K.repo, color: COL.bar },
+  { label: `Every .py file that mentions “${K.grepWord}” (${K.grepFiles})`, value: K.grep, color: COL.bar },
+  { label: `Only the ${K.answerFiles.length} files the answer is in`, value: K.answer, color: COL.bar },
+  { label: "The ContextGraph briefing", value: K.briefing, color: COL.brief },
+];
+
+function drawPanel(t) {
+  const x = PX;
+  text("Information waterfall", x, 104, { font: `600 16px ${SANS}` });
+  ROWS.forEach((r, k) => {
+    const a = seg(t, [r.at, r.at + 0.5]);
+    if (!a) return;
+    const y = 136 + k * 50 + (1 - ease(a)) * 6;
+    const next = ROWS[k + 1];
+    if (next && seg(t, [next.at, next.at + 0.5])) {
+      ctx.globalAlpha = 0.9; ctx.fillStyle = COL.hair; ctx.fillRect(x + 4.5, y + 5, 1, 32); ctx.globalAlpha = 1;
+    }
+    dot(x + 5, y - 5, 5, r.color, a, false);
+    const active = !next || t < next.at;
+    text(r.title, x + 20, y, { font: `600 14.5px ${SANS}`, color: active ? COL.ink : COL.ink2, alpha: a });
+    text(r.detail, x + 20, y + 18, { font: `13px ${SANS}`, color: COL.muted, alpha: a });
+  });
+
+  const ca = seg(t, [T.bars[0] - 0.4, T.bars[0]]);
+  if (!ca) return;
+  const y0 = 346;
+  text("Tokens to read for this question", x, y0, { font: `600 16px ${SANS}`, alpha: ca });
+  const maxLen = W - x - 72;
+  BARS.forEach((b, k) => {
+    const start = T.bars[0] + k * 0.7;
+    const la = seg(t, [start - 0.2, start]);
+    if (!la) return;
+    const g = ease(seg(t, [start, start + 0.6]));
+    const y = y0 + 28 + k * 38;
+    text(b.label, x, y, { font: `13px ${SANS}`, color: COL.ink2, alpha: la });
+    const len = Math.max(3, (b.value / BARS[0].value) * maxLen) * g;
+    ctx.fillStyle = b.color;
+    ctx.beginPath(); ctx.roundRect(x, y + 7, len, 12, [0, 4, 4, 0]); ctx.fill();
+    text(kfmt(Math.round(b.value * g)), x + len + 8, y + 17.5, { font: `600 13.5px ${SANS}`, alpha: g });
+  });
+  const cl = seg(t, T.callout);
+  if (cl) {
+    const ratio = Math.round(K.answer / K.briefing);
+    text(`${ratio}× fewer tokens than reading only the right files`, x, y0 + 198, { font: `600 14.5px ${SANS}`, alpha: cl });
+    text("Token counts estimated at 3.3 characters per token.", x, y0 + 218, { font: `12.5px ${SANS}`, color: COL.muted, alpha: cl });
+  }
+}
+
+// ---- One frame.
+function renderFrame(t) {
+  ctx.fillStyle = COL.surface; ctx.fillRect(0, 0, W, H);
+
+  text("How ContextGraph picks the context for a task", 20, 36, { font: `600 20px ${SANS}` });
+  const q = `$ contextgraph context "${M.query}" --budget ${M.budget}`;
+  text(q.slice(0, Math.round(q.length * seg(t, T.type))), 20, 61, { font: `13.5px ${MONO}`, color: COL.ink2 });
+
+  const packK = ease(seg(t, T.pack));      // unpicked candidates fade as the briefing is packed
+  const focusK = ease(seg(t, T.focus));    // the graph dims and the picks move into the diagram
+  const labelsK = seg(t, T.labels);
+
+  ctx.globalAlpha = lerp(1, 0.1, focusK); ctx.drawImage(bg, 0, 0); ctx.globalAlpha = 1;
+
+  // Graph walk: an edge grows from a known node to a new one, hop 1 and then hop 2.
+  const walkAlpha = 0.8 * (1 - 0.8 * packK) * (1 - focusK);
+  for (const [list, span] of [[walk1, T.walk1], [walk2, T.walk2]]) {
+    const k = seg(t, span);
+    if (!k || walkAlpha < 0.01) continue;
+    list.forEach(([n, src], j) => {
+      const local = ease(clamp(k * 1.6 - (j / list.length) * 0.6));
+      if (!local) return;
+      const [x0, y0] = P(src), [x1, y1] = P(n);
+      line(x0, y0, lerp(x0, x1, local), lerp(y0, y1, local), COL.walk, walkAlpha, 1.3, null, false);
+    });
+  }
+
+  // Search hits, with a ring on the best ones (the seeds of the walk).
+  const sk = seg(t, T.search), seedK = seg(t, T.seeds);
+  S.hits.forEach((n, k) => {
+    if (picked.has(n) && packK) return;
+    const local = clamp(sk * 1.5 - (k / S.hits.length) * 0.5);
+    if (!local) return;
+    const r = local < 1 ? 1.5 + 3.5 * Math.sin(Math.PI * local) + 1.5 * local : 3;
+    const alpha = (seeds.has(n) ? 1 : lerp(1, 0.6, seedK)) * (1 - 0.8 * packK) * (1 - focusK);
+    if (alpha < 0.01) return;
+    const [x, y] = P(n);
+    dot(x, y, r, COL.search, alpha);
+    if (seeds.has(n) && seedK) {
+      ctx.globalAlpha = alpha * seedK; ctx.strokeStyle = COL.ink; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(x, y, r + 3.5, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+  });
+  for (const [list, span] of [[walk1, T.walk1], [walk2, T.walk2]]) {
+    const k = seg(t, span);
+    list.forEach(([n], j) => {
+      if (hitSet.has(n) || (picked.has(n) && packK)) return;   // search hits keep their colour
+      const local = clamp(k * 1.6 - (j / list.length) * 0.6 - 0.4);
+      const alpha = (1 - 0.8 * packK) * (1 - focusK);
+      if (local && alpha > 0.01) dot(...P(n), 1.5 + 1.5 * ease(local), COL.walk, alpha);
+    });
+  }
+
+  // The briefing: picked nodes turn green, then move into the diagram.
+  if (packK) {
+    if (labelsK) {
+      for (const [s, d] of FL.calls) {
+        const a = focus.get(s), b = focus.get(d);
+        line(a.x, a.y + 12, b.x, b.y - 13, COL.ink2, 0.85 * labelsK);
+      }
+      if (FL.memory && FL.memory.target !== undefined && focus.get(FL.memory.target).y === FL.memory.y) {
+        const m = FL.memory, b = focus.get(m.target);
+        line(m.x - m.w / 2 - 1, m.y, b.x + b.w / 2 + 4, b.y, COL.ink2, 0.85 * labelsK, 1.3, [2, 3]);
+      }
+    }
+    const growK = ease(clamp(labelsK * 2)), textK = clamp(labelsK * 2 - 1);
+    for (const i of picked) {
+      const f = focus.get(i);
+      const [x, y] = where(i, t);
+      if (!f.test && labelsK) pill(x, y, lerp(8, f.w, growK), f.text, 1, 12, textK);
+      else if (!(f.owner !== undefined && textK >= 1)) dot(x, y, f.test ? 3 : lerp(3.4, 4, focusK), COL.brief, packK);
+    }
+    if (labelsK) {
+      for (const f of focus.values()) if (!f.test && f.tests && textK) badge(f.x + f.w / 2 - 3, f.y - 12, f.tests, textK);
+      if (FL.loneTests.length)
+        text(`${FL.loneTests.length} more tests`, GRAPH.x + GRAPH.w / 2, FL.loneY + 22,
+          { font: `12.5px ${SANS}`, color: COL.ink2, align: "center", alpha: labelsK });
+      if (FL.memory) pill(FL.memory.x, FL.memory.y, lerp(8, FL.memory.w, growK), FL.memory.text, labelsK, 4, textK);
+
+      // Legend.
+      const ly = GRAPH.y + GRAPH.h - 6;
+      line(GRAPH.x + 2, ly - 5, GRAPH.x + 30, ly - 5, COL.ink2, 0.85 * labelsK);
+      text("calls", GRAPH.x + 38, ly, { font: `13px ${SANS}`, color: COL.ink2, alpha: labelsK });
+      badge(GRAPH.x + 95, ly - 5, "n", labelsK);
+      text("tests that cover it", GRAPH.x + 110, ly, { font: `13px ${SANS}`, color: COL.ink2, alpha: labelsK });
+      if (FL.memory) {
+        line(GRAPH.x + 240, ly - 5, GRAPH.x + 268, ly - 5, COL.ink2, 0.85 * labelsK, 1.3, [2, 3]);
+        text("saved memory", GRAPH.x + 276, ly, { font: `13px ${SANS}`, color: COL.ink2, alpha: labelsK });
+      }
+    }
+  }
+
+  ctx.fillStyle = COL.hair; ctx.fillRect(PX - 18, 84, 1, 496);
+  drawPanel(t);
+}
+
+window.DURATION = DURATION;
+window.renderFrame = renderFrame;
+window.ready = true;
+
+// Opened directly in a browser: play in a loop.
+if (!navigator.webdriver) {
+  const t0 = performance.now();
+  (function loop() { renderFrame(((performance.now() - t0) / 1000) % DURATION); requestAnimationFrame(loop); })();
+}
+</script>
+</body>
+</html>
